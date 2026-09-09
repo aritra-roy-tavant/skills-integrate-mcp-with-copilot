@@ -5,14 +5,98 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import hashlib
+import json
+import os
+import secrets
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
-from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+bearer_scheme = HTTPBearer(auto_error=False)
+session_tokens = {}
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), salt, 600_000
+    )
+    return f"{salt.hex()}${password_hash.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt_hex, expected_hash = stored_hash.split("$", 1)
+        actual_hash = hash_password(password, bytes.fromhex(salt_hex)).split("$", 1)[1]
+    except (ValueError, TypeError):
+        return False
+    return secrets.compare_digest(actual_hash, expected_hash)
+
+
+def load_users() -> dict:
+    users_file = os.getenv("MERGINGTON_USERS_FILE")
+    if users_file:
+        with open(users_file, encoding="utf-8") as file:
+            return json.load(file)
+
+    return {
+        "teacher@mergington.edu": {
+            "role": "faculty",
+            "password_hash": hash_password(
+                os.getenv("MERGINGTON_TEACHER_PASSWORD", "teacher-password")
+            ),
+        },
+        "student@mergington.edu": {
+            "role": "student",
+            "password_hash": hash_password(
+                os.getenv("MERGINGTON_STUDENT_PASSWORD", "student-password")
+            ),
+        },
+    }
+
+
+users = load_users()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = session_tokens.get(credentials.credentials)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+
+def require_activity_access(email: str, user: dict) -> None:
+    if user["role"] != "faculty" and user["email"] != email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Students can only manage their own enrollment",
+        )
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -83,14 +167,39 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.post("/auth/login")
+def login(request: LoginRequest):
+    user = users.get(request.email)
+    if user is None or not verify_password(request.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = secrets.token_urlsafe(32)
+    session_tokens[token] = {"email": request.email, "role": user["role"]}
+    return {"access_token": token, "token_type": "bearer", "user": session_tokens[token]}
+
+
+@app.get("/auth/me")
+def get_logged_in_user(user: dict = Depends(get_current_user)):
+    return user
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    user: dict = Depends(get_current_user),
+):
     """Sign up a student for an activity"""
+    require_activity_access(email, user)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +220,13 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    user: dict = Depends(get_current_user),
+):
     """Unregister a student from an activity"""
+    require_activity_access(email, user)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")

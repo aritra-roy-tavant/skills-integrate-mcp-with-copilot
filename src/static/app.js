@@ -3,6 +3,28 @@ document.addEventListener("DOMContentLoaded", () => {
   const activitySelect = document.getElementById("activity");
   const signupForm = document.getElementById("signup-form");
   const messageDiv = document.getElementById("message");
+  const loginForm = document.getElementById("login-form");
+  const logoutButton = document.getElementById("logout-button");
+  const authMessage = document.getElementById("auth-message");
+  let accessToken = localStorage.getItem("accessToken");
+
+  function authHeaders() {
+    return accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+  }
+
+  function showAuthMessage(message, className) {
+    authMessage.textContent = message;
+    authMessage.className = className;
+    authMessage.classList.remove("hidden");
+  }
+
+  function updateAuthControls(user) {
+    loginForm.classList.toggle("hidden", Boolean(user));
+    logoutButton.classList.toggle("hidden", !user);
+    if (user) {
+      showAuthMessage(`Signed in as ${user.email} (${user.role})`, "success");
+    }
+  }
 
   // Function to fetch activities from API
   async function fetchActivities() {
@@ -80,6 +102,7 @@ document.addEventListener("DOMContentLoaded", () => {
         )}/unregister?email=${encodeURIComponent(email)}`,
         {
           method: "DELETE",
+          headers: authHeaders(),
         }
       );
 
@@ -124,6 +147,7 @@ document.addEventListener("DOMContentLoaded", () => {
         )}/signup?email=${encodeURIComponent(email)}`,
         {
           method: "POST",
+          headers: authHeaders(),
         }
       );
 
@@ -154,6 +178,48 @@ document.addEventListener("DOMContentLoaded", () => {
       console.error("Error signing up:", error);
     }
   });
+
+  loginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const response = await fetch("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: document.getElementById("login-email").value,
+        password: document.getElementById("login-password").value,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      showAuthMessage(result.detail || "Sign in failed", "error");
+      return;
+    }
+    accessToken = result.access_token;
+    localStorage.setItem("accessToken", accessToken);
+    loginForm.reset();
+    updateAuthControls(result.user);
+  });
+
+  logoutButton.addEventListener("click", () => {
+    accessToken = null;
+    localStorage.removeItem("accessToken");
+    logoutButton.classList.add("hidden");
+    loginForm.classList.remove("hidden");
+    authMessage.classList.add("hidden");
+  });
+
+  if (accessToken) {
+    fetch("/auth/me", { headers: authHeaders() })
+      .then((response) => {
+        if (!response.ok) throw new Error("Session expired");
+        return response.json();
+      })
+      .then(updateAuthControls)
+      .catch(() => {
+        accessToken = null;
+        localStorage.removeItem("accessToken");
+      });
+  }
 
   // Initialize app
   fetchActivities();
